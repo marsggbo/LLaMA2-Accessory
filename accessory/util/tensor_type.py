@@ -34,7 +34,7 @@ class default_tensor_type:
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
+        exc_type,
         exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
     ) -> None:

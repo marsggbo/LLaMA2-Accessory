@@ -83,7 +83,7 @@ def _tensor_list_max_diff(tensors: List[torch.Tensor]) -> float:
 def _load_checkpoint_and_merge_ranks(
     model: nn.Module, ckpt_path: str, ckpt_mp_world_size: int,
     verbose: bool, format: str,
-) -> OrderedDict[str, torch.Tensor]:
+):
     weight_parallel_dim = get_weight_parallel_dim(model)
     named_parameters = dict(model.named_parameters())
 
@@ -133,7 +133,7 @@ def _load_checkpoint_and_merge_ranks(
 def _load_checkpoint_and_split_rank(
     model: nn.Module, ckpt_path: str, ckpt_mp_world_size: int,
     verbose: bool, format: str,
-) -> OrderedDict[str, torch.Tensor]:
+):
     weight_parallel_dim = get_weight_parallel_dim(model)
     named_parameters = dict(model.named_parameters())
 
@@ -164,7 +164,7 @@ def _load_checkpoint_and_split_rank(
 def _load_checkpoint_and_redistribute_general(
     model: nn.Module, ckpt_path: str, ckpt_mp_world_size: int,
     verbose: bool, format: str,
-) -> OrderedDict[str, torch.Tensor]:
+):
     raise NotImplementedError()
 
 
@@ -228,7 +228,7 @@ def load_tensor_parallel_shard_state_dict(
 
 def load_tensor_parallel_model_state_dict(
     model: nn.Module, path: str, format: str, verbose: bool = False
-) -> OrderedDict[str, torch.Tensor]:
+):
     r"""This function loads tensor parallel checkpoints and handles
     different formats (e.g., saved by different training frameworks or
     released by different organizations) and potentially a change of tensor
@@ -423,7 +423,7 @@ def load_diff_checkpoint(
 
 
 def load_tensor_parallel_model_list(
-    model: nn.Module, path_list: str|List[str], verbose: bool = False
+    model: nn.Module, path_list, verbose: bool = False
 ) -> Dict:
     r"""This method accepts a list of checkpoint paths, and load each
     checkpoint to the model in the order as given in the list. The behaviors

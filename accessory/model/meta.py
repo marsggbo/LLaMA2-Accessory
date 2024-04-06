@@ -18,7 +18,7 @@ import torch.distributed as dist
 
 class MetaModel(nn.Module):
     def __init__(
-        self, llama_type: str, llama_config: str|List[str], tokenizer_path: str,
+        self, llama_type: str, llama_config, tokenizer_path: str,
         with_visual: bool = False, max_seq_len: int = 4096
     ) -> None:
         super().__init__()
@@ -41,9 +41,14 @@ class MetaModel(nn.Module):
 
         tokenizer = Tokenizer(model_path=tokenizer_path)
         llama_args['vocab_size'] = tokenizer.n_words
+        if os.environ.get('DEBUG', False):
+            # for debug
+            llama_args['dim'] = 1024 
+            llama_args['hidden_dim'] = 4096
+            llama_args['n_layers'] = 1
+            llama_args['moe']['num_experts'] = 2
 
         llama_args: ModelArgs = ModelArgs(**llama_args)
-
         if "tokenizer" in inspect.signature(Transformer.__init__).parameters:
             # generally it means the inner llm modify change the tokenizer
             model = Transformer(llama_args, tokenizer, with_visual=with_visual)
@@ -78,12 +83,12 @@ class MetaModel(nn.Module):
         print(f"Trainable parameter count : {param_count_local} (local rank), {param_count_all} (all).")
 
     @classmethod
-    def from_pretrained(cls, pretrained_path: str|List[str],
+    def from_pretrained(cls, pretrained_path,
                         llama_type: Optional[str] = None,
-                        llama_config: Optional[str|List[str]] = None,
+                        llama_config= None,
                         tokenizer_path: Optional[str] = None,
                         with_visual: bool = False, max_seq_len: int = 4096,
-                        mp_group: Optional[dist.ProcessGroup] = None,
+                        mp_group= None,
                         dtype=torch.bfloat16, device="cuda", quant=False):
         """
         Besides loading the `consolidated.*.pth` model weights, this function also tries to find tokenizer,
@@ -188,12 +193,13 @@ class MetaModel(nn.Module):
 
         with default_tensor_type(dtype=dtype, device="cpu" if quant else device):
             model = cls(llama_type, llama_config, tokenizer_path, with_visual, max_seq_len)
-        print(f"Loading pretrained weights from {pretrained_path} ...")
-        load_result = tensor_parallel.load_tensor_parallel_model_list(model, pretrained_path)
-        if load_result != {'missing_keys': [], 'unexpected_keys': []}:
-            warnings.warn(f"checkpoint and model mismatch: \n{load_result}")
-        else:
-            print("all params match perfectly!")
+        if not os.environ.get('DEBUG', False):
+            print(f"Loading pretrained weights from {pretrained_path} ...")
+            load_result = tensor_parallel.load_tensor_parallel_model_list(model, pretrained_path)
+            if load_result != {'missing_keys': [], 'unexpected_keys': []}:
+                warnings.warn(f"checkpoint and model mismatch: \n{load_result}")
+            else:
+                print("all params match perfectly!")
 
         if quant:
             from accessory.util.quant import quantize
@@ -255,7 +261,7 @@ class MetaModel(nn.Module):
         return c_loss, additional_loss
 
     @ torch.inference_mode()
-    def compute_logits(self, examples: List[str|List[int]], images:Optional[torch.FloatTensor]=None,
+    def compute_logits(self, examples, images:Optional[torch.FloatTensor]=None,
                        bos=True, eos=False) -> List[torch.FloatTensor]:
         """
         Compute logits for a given list of text examples or token lists, optionally incorporating images.
@@ -296,7 +302,7 @@ class MetaModel(nn.Module):
         return logits
 
     @ torch.inference_mode()
-    def evaluate_examples(self, examples: List[str|List[int]], contexts: Optional[List[str|List[int]]] = None,
+    def evaluate_examples(self, examples, contexts = None,
                           images:Optional[torch.FloatTensor]=None, bos=True, eos=False) -> Dict[str, List]:
         """
         Evaluate text examples with optional contexts and images, returning various evaluation metrics.
