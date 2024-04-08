@@ -285,7 +285,23 @@ class MoE(nn.Module):
         x_for_ffn = x_for_ffn.repeat_interleave(self.num_experts_per_tok, dim=0)
         y = torch.zeros_like(x_for_ffn)
         for str_i, expert in self.experts.items():
-            y[flat_expert_indices == int(str_i)] = expert(x_for_ffn[flat_expert_indices == int(str_i)])
+            # normal case:
+            mask = flat_expert_indices == int(str_i)
+    
+            # # long-tail:
+            # mask = torch.zeros_like(flat_expert_indices)
+            # num_tokens_all = x.shape[0] * self.num_experts_per_tok
+            # num_tokens_per_ep_group = num_tokens_all // self.num_experts_per_tok
+            # if int(str_i) in list(range(self.num_experts_per_tok)):
+            #     mask[:num_tokens_per_ep_group] = 1
+
+            # # uniform case:
+            # mask = torch.zeros_like(flat_expert_indices)
+            # num_tokens_all = x.shape[0] * self.num_experts_per_tok
+            # num_tokens_per_ep_group = num_tokens_all // self.num_experts
+            # mask[:num_tokens_per_ep_group] = 1
+
+            y[mask] = expert(x_for_ffn[mask])
 
         # score meet ffn_output
         y = (y.view(*expert_weights.shape, -1) * expert_weights.unsqueeze(-1)).sum(dim=1)
