@@ -196,7 +196,7 @@ def main():
     model = model.bfloat16().to(device)
     
     print('Warm up model inference')
-    x = torch.randint(0, 10000, (64, 128)).to(device)
+    x = torch.randint(0, 10000, (2, 128)).to(device)
     out = model.llma.forward_inference(x, 0)
     print(out.shape)
     out, _ = model.llma(x)
@@ -224,7 +224,7 @@ def main():
     #     out = model.llma.forward_inference(input_ids, 0)
     #     print(input_ids.shape, out.shape, attention_mask.sum(-1).max(), attention_mask.sum(-1).view(-1)[:20])
 
-    batch_size = 128
+    batch_size = 32
     num_samples = 2048
     # dataset = Dataset.load_from_disk('/home/nus-hx/code/vllm/examples/data/sst2_10000_mrpc_2000_MixtralMoE_patterns')
     dataset = load_dataset("marsggbo/sst2_10000_mrpc_2000_MixtralMoE_patterns")['train']
@@ -239,8 +239,10 @@ def main():
         samples = dataset.select(indices)
         input_ids = [sample['token_idx'][:sample['prompt_len']] for sample in samples]
         input_ids = tokenizer.pad({'input_ids': input_ids}, return_tensors='pt')['input_ids'].to(device)
+        torch.cuda.synchronize()
         start = time.time()
         out = model.llma.forward_inference(input_ids, 0)
+        torch.cuda.synchronize()
         end = time.time()
         batch_time = end - start
         normal_time_cost.append(batch_time)
@@ -280,8 +282,10 @@ def main():
     #     input_ids = [token_idx_list[i] for i in batch_indices]
     #     input_ids = tokenizer.pad({'input_ids': input_ids}, return_tensors='pt')['input_ids'].to(device)
     #     batch_indices_list.append(batch_indices)
+    #     torch.cuda.synchronize()
     #     start = time.time()
     #     out = model.llma.forward_inference(input_ids, 0)
+    #     torch.cuda.synchronize()
     #     end = time.time()
     #     batch_time = end - start
     #     schedule_time_cost.append(batch_time)

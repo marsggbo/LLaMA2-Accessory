@@ -305,6 +305,7 @@ class MoE(nn.Module):
                 num_tokens_per_ep_group = num_tokens_all // self.num_experts
                 mask[:num_tokens_per_ep_group] = 1
 
+            mask = mask.bool()
             y[mask] = expert(x_for_ffn[mask])
 
         # score meet ffn_output
