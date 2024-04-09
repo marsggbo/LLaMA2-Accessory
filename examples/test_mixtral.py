@@ -224,56 +224,10 @@ def main():
     #     out = model.llma.forward_inference(input_ids, 0)
     #     print(input_ids.shape, out.shape, attention_mask.sum(-1).max(), attention_mask.sum(-1).view(-1)[:20])
 
-    print('Loading Scheduler...')
     batch_size = 128
     num_samples = 2048
-    scheduler = PatternScheduler(
-        predictor=0, tokenizer=0,
-        queue_max_length=batch_size,
-        window_size=10,
-        gpu_memory_limit=-1,
-        device=device
-    )
-    dataset = Dataset.load_from_disk('/home/nus-hx/code/vllm/examples/data/sst2_10000_mrpc_2000_MixtralMoE_patterns')
-
-    print('Benchmark inference speed of scheduled order')
-    matrix_list = []
-    token_idx_list = []
-    for i in range(num_samples):
-        sample = dataset[i]
-        prompt_len = sample['prompt_len']
-        token_idx_list.append(sample['token_idx'][:prompt_len])
-        matrix_list.append(sample['token_expert_patterns'][:prompt_len])
-    batch_indices_list = []
-    reorder_time_cost = []
-    schedule_time_cost = []
-    step = 0
-    while matrix_list:
-        start = time.time()
-        sorted_matrix_indices = scheduler.schedule_pattern_matrix_list(matrix_list)
-        end = time.time()
-        reorder_time_cost.append(end - start)
-        if step<8:
-            print(f"Scheduling takes {end - start:.4f}s")
-        
-        batch_indices = sorted_matrix_indices[:batch_size]
-        input_ids = [token_idx_list[i] for i in batch_indices]
-        input_ids = tokenizer.pad({'input_ids': input_ids}, return_tensors='pt')['input_ids'].to(device)
-        batch_indices_list.append(batch_indices)
-        start = time.time()
-        out = model.llma.forward_inference(input_ids, 0)
-        end = time.time()
-        batch_time = end - start
-        schedule_time_cost.append(batch_time)
-        if step<8:
-            print(f"Batch-{step} takes {batch_time:.4f}s")
-        step += 1
-        matrix_list = [matrix_list[i] for i in range(len(matrix_list)) if i not in batch_indices]
-        token_idx_list = [token_idx_list[i] for i in range(len(token_idx_list)) if i not in batch_indices]
-    schedule_throughput = num_samples / np.sum(schedule_time_cost)
-    print(f"Reorder averagely takes {np.mean(reorder_time_cost):.4f}s")
-    print(f"Scheduler averagely takes {np.mean(schedule_time_cost):.4f}, throughput is {schedule_throughput:.4f} tokens/s.")
-
+    # dataset = Dataset.load_from_disk('/home/nus-hx/code/vllm/examples/data/sst2_10000_mrpc_2000_MixtralMoE_patterns')
+    dataset = load_dataset("marsggbo/sst2_10000_mrpc_2000_MixtralMoE_patterns")['train']
 
     # ########################
     # # inference token_ids
@@ -295,6 +249,52 @@ def main():
     normal_throughput = num_samples / sum(normal_time_cost)
     print(f'Normal averagely takes {np.mean(normal_time_cost):.4f}s per batch, throughput is {normal_throughput:.4f} token/s')
 
+    # print('Benchmark inference speed of scheduled order')
+    # print('Loading Scheduler...')
+    # scheduler = PatternScheduler(
+    #     predictor=0, tokenizer=0,
+    #     queue_max_length=batch_size,
+    #     window_size=10,
+    #     gpu_memory_limit=-1,
+    #     device=device
+    # )
+    # matrix_list = []
+    # token_idx_list = []
+    # for i in range(num_samples):
+    #     sample = dataset[i]
+    #     prompt_len = sample['prompt_len']
+    #     token_idx_list.append(sample['token_idx'][:prompt_len])
+    #     matrix_list.append(sample['token_expert_patterns'][:prompt_len])
+    # batch_indices_list = []
+    # reorder_time_cost = []
+    # schedule_time_cost = []
+    # step = 0
+    # while matrix_list:
+    #     start = time.time()
+    #     sorted_matrix_indices = scheduler.schedule_pattern_matrix_list(matrix_list)
+    #     end = time.time()
+    #     reorder_time_cost.append(end - start)
+    #     if step<8:
+    #         print(f"Scheduling takes {end - start:.4f}s")
+    #     batch_indices = sorted_matrix_indices[:batch_size]
+    #     input_ids = [token_idx_list[i] for i in batch_indices]
+    #     input_ids = tokenizer.pad({'input_ids': input_ids}, return_tensors='pt')['input_ids'].to(device)
+    #     batch_indices_list.append(batch_indices)
+    #     start = time.time()
+    #     out = model.llma.forward_inference(input_ids, 0)
+    #     end = time.time()
+    #     batch_time = end - start
+    #     schedule_time_cost.append(batch_time)
+    #     if step<8:
+    #         print(f"Batch-{step} takes {batch_time:.4f}s")
+    #     step += 1
+    #     matrix_list = [matrix_list[i] for i in range(len(matrix_list)) if i not in batch_indices]
+    #     token_idx_list = [token_idx_list[i] for i in range(len(token_idx_list)) if i not in batch_indices]
+    # schedule_throughput = num_samples / np.sum(schedule_time_cost)
+    # print(f"Reorder averagely takes {np.mean(reorder_time_cost):.4f}s")
+    # print(f"Scheduler averagely takes {np.mean(schedule_time_cost):.4f}, throughput is {schedule_throughput:.4f} tokens/s.")
+
+
 
 if __name__ == '__main__':
     main()
@@ -302,3 +302,5 @@ if __name__ == '__main__':
 # 8 GPUs
 # torchrun --nproc-per-node=8 --master-port=6869 test_mixtral.py --pretrained_path /data/personal/nus-hx/huggingface/hub/MoE-Mixtral-7B-8Expert 
 # DEBUG=1 CUDA_VISIBLE_DEVICES=5 torchrun --nproc-per-node=1 --master-port=6869 test_mixtral.py --pretrained_path /data/personal/nus-hx/huggingface/hub/MoE-Mixtral-7B-8Expert 
+
+# EXPERT_DISTRIBUTION="uniform" torchrun --nproc-per-node=8 --master-port=6869 test_mixtral.py --pretrained_path /data/personal/nus-hx/huggingface/hub/MoE-Mixtral-7B-8Expert 
