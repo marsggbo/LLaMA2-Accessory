@@ -149,7 +149,7 @@ def init_env(args):
 
 def main():
     args = get_args_parser().parse_args()
-    if os.environ.get('DEBUG', 0):
+    if os.environ.get('ipdb', 0):
         from ipdb import set_trace
         set_trace()
     init_env(args)
@@ -225,8 +225,8 @@ def main():
     #     print(input_ids.shape, out.shape, attention_mask.sum(-1).max(), attention_mask.sum(-1).view(-1)[:20])
 
     print('Loading Scheduler...')
-    batch_size = 64
-    num_samples = 1024
+    batch_size = 128
+    num_samples = 2048
     scheduler = PatternScheduler(
         predictor=0, tokenizer=0,
         queue_max_length=batch_size,
@@ -275,13 +275,13 @@ def main():
     print(f"Scheduler averagely takes {np.mean(schedule_time_cost):.4f}, throughput is {schedule_throughput:.4f} tokens/s.")
 
 
-    ########################
-    # inference token_ids
-    ########################
+    # ########################
+    # # inference token_ids
+    # ########################
     print('Benchmark inference speed of normal order')
     normal_indices = list(range(num_samples))
     normal_time_cost = []
-    for i, indices in enumerate(np.array_split(normal_indices, batch_size)):
+    for i, indices in enumerate(np.array_split(normal_indices, num_samples/batch_size)):
         samples = dataset.select(indices)
         input_ids = [sample['token_idx'][:sample['prompt_len']] for sample in samples]
         input_ids = tokenizer.pad({'input_ids': input_ids}, return_tensors='pt')['input_ids'].to(device)
@@ -291,7 +291,7 @@ def main():
         batch_time = end - start
         normal_time_cost.append(batch_time)
         if i<8:
-            print(f"Batch-{i} takes {batch_time:.4f}s")
+            print(f"Batch-{i} {input_ids.shape} takes {batch_time:.4f}s")
     normal_throughput = num_samples / sum(normal_time_cost)
     print(f'Normal averagely takes {np.mean(normal_time_cost):.4f}s per batch, throughput is {normal_throughput:.4f} token/s')
 

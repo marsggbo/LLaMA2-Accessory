@@ -43,10 +43,10 @@ class MetaModel(nn.Module):
         llama_args['vocab_size'] = tokenizer.n_words
         if os.environ.get('DEBUG', False):
             # for debug
-            llama_args['dim'] = 1024 
-            llama_args['hidden_dim'] = 4096
-            llama_args['n_layers'] = 1
-            llama_args['moe']['num_experts'] = 2
+            llama_args['dim'] = 4096 
+            llama_args['hidden_dim'] = 14336
+            llama_args['n_layers'] = 2
+            llama_args['moe']['num_experts'] = 8
 
         llama_args: ModelArgs = ModelArgs(**llama_args)
         if "tokenizer" in inspect.signature(Transformer.__init__).parameters:
