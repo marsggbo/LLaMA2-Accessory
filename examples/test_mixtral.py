@@ -225,7 +225,7 @@ def main():
     #     print(input_ids.shape, out.shape, attention_mask.sum(-1).max(), attention_mask.sum(-1).view(-1)[:20])
 
     batch_size = 32
-    num_samples = 2048
+    num_samples = 3200
     # dataset = Dataset.load_from_disk('/home/nus-hx/code/vllm/examples/data/sst2_10000_mrpc_2000_MixtralMoE_patterns')
     dataset = load_dataset("marsggbo/sst2_10000_mrpc_2000_MixtralMoE_patterns")['train']
 
@@ -235,6 +235,7 @@ def main():
     print('Benchmark inference speed of normal order')
     normal_indices = list(range(num_samples))
     normal_time_cost = []
+    normal_tokens = []
     for i, indices in enumerate(np.array_split(normal_indices, num_samples/batch_size)):
         samples = dataset.select(indices)
         input_ids = [sample['token_idx'][:sample['prompt_len']] for sample in samples]
@@ -245,10 +246,12 @@ def main():
         torch.cuda.synchronize()
         end = time.time()
         batch_time = end - start
-        normal_time_cost.append(batch_time)
-        if i<8:
+        if i > 10:
+            normal_time_cost.append(batch_time)
+            normal_tokens.append(input_ids.numel())
+        if i<20:
             print(f"Batch-{i} {input_ids.shape} takes {batch_time:.4f}s")
-    normal_throughput = num_samples / sum(normal_time_cost)
+    normal_throughput = sum(normal_tokens) / sum(normal_time_cost)
     print(f'Normal averagely takes {np.mean(normal_time_cost):.4f}s per batch, throughput is {normal_throughput:.4f} token/s')
 
     # print('Benchmark inference speed of scheduled order')
