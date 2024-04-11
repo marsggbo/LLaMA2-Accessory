@@ -19,6 +19,7 @@ import copy
 import math
 import warnings
 from typing import Optional, Tuple, Union
+import functools
 
 import torch
 import torch.nn as nn
@@ -51,11 +52,9 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_switch_transformers import SwitchTransformersConfig
+from transformers.models.switch_transformers.configuration_switch_transformers import SwitchTransformersConfig
 
-# from transformers.models.switch_transformers.configuration_switch_transformers import SwitchTransformersConfig
-
-
+default_linear_init = functools.partial(nn.init.kaiming_uniform_, a=math.sqrt(5))
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "SwitchTransformersConfig"
@@ -294,8 +293,14 @@ class SwitchTransformersSparseMLP(nn.Module):
         self.router = SwitchTransformersTop1Router(config)
 
         # Step 2: Get the experts
+        mp_size = fs_init.get_model_parallel_world_size()
+        mp_rank = fs_init.get_model_parallel_rank()
+        assert config.num_experts % mp_size == 0
+        self.num_experts = config.num_experts
+        n_local_experts = config.num_experts // mp_size
+        self.local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
         self.experts = nn.ModuleDict()
-        for idx in range(config.num_experts):
+        for idx in self.local_experts:
             self.experts[f"expert_{idx}"] = expert_class(config)
 
     def forward(self, hidden_states):
@@ -311,18 +316,31 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         """
         # Step 1: Get the router_mask from the router as wel as the probabilities
+        # router_mask.shape is (batch, seq_len, num_experts), dtype is int64，每个 token 对应长度为 num_experts 的 one-hot 序列
+        # router_probs.shape is (batch, seq_len, 1), dtype is float
+        # router_logits.shape is (batch, seq_len, num_experts), dtype is float
         router_mask, router_probs, router_logits = self.router(hidden_states)
-        expert_index = torch.argmax(router_mask, dim=-1)
+        expert_index = torch.argmax(router_mask, dim=-1) # shape is (batch, seq_len), dtype is int64
 
         # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
-        next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
+        # new
+        next_states = torch.zeros_like(hidden_states)
+        for expert_idx, expert in self.experts.items():
+            idx = int(expert_idx.split('_')[1])
             token_indices = router_mask[:, :, idx].bool()
-            next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+            if torch.any(token_indices):
+                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype) * router_probs[token_indices]
+        hidden_states = reduce_from_model_parallel_region(next_states)
 
-        hidden_states = router_probs * next_states
+        # # original
+        # next_states = hidden_states.clone()
+        # for idx, expert in enumerate(self.experts.values()):
+        #     token_indices = router_mask[:, :, idx].bool()
+        #     next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
+        # hidden_states = router_probs * next_states
+
         return hidden_states, (router_logits, expert_index)
 
 
@@ -383,13 +401,20 @@ class SwitchTransformersAttention(nn.Module):
         self.inner_dim = self.n_heads * self.key_value_proj_dim
 
         # Mesh TensorFlow initialization to avoid scaling before softmax
-        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
-        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+        self.mp_size = fs_init.get_model_parallel_world_size()
+        self.mp_rank = fs_init.get_model_parallel_rank()
+        self.q = ColumnParallelLinear(
+            self.d_model, self.inner_dim, bias=False, gather_output=False, init_method=default_linear_init)
+        self.k = ColumnParallelLinear(
+            self.d_model, self.inner_dim, bias=False, gather_output=False, init_method=default_linear_init)
+        self.v = ColumnParallelLinear(
+            self.d_model, self.inner_dim, bias=False, gather_output=False, init_method=default_linear_init)
+        self.o = RowParallelLinear(
+            self.inner_dim, self.d_model, bias=False, input_is_parallel=True, init_method=default_linear_init)
+        
 
         if self.has_relative_attention_bias:
-            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
+            self.relative_attention_bias = ParallelEmbedding(self.relative_attention_num_buckets, self.n_heads, init_method=default_linear_init)
         self.pruned_heads = set()
         self.gradient_checkpointing = False
 
@@ -507,11 +532,11 @@ class SwitchTransformersAttention(nn.Module):
 
         def shape(states):
             """projection"""
-            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim//self.mp_size).transpose(1, 2)
 
         def unshape(states):
             """reshape"""
-            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim//self.mp_size)
 
         def project(hidden_states, proj_layer, key_value_states, past_key_value):
             """projects hidden states correctly to key/query states"""
@@ -862,7 +887,11 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
             key_value_proj_dim = self.config.d_kv
             n_heads = self.config.num_heads
             module.router.classifier.weight.data.normal_(mean=0.0, std=factor * 1)
-            for idx in range(self.config.num_experts):
+            mp_rank = fs_init.get_model_parallel_rank()
+            mp_size = fs_init.get_model_parallel_world_size()
+            n_local_experts = config.num_experts // mp_size
+            local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
+            for idx in local_experts:
                 module.experts[f"expert_{idx}"].wi.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
                 module.experts[f"expert_{idx}"].wo.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
 
@@ -898,7 +927,7 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
     def __init__(self, config, embed_tokens=None):
         super().__init__(config)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
+        self.embed_tokens = ParallelEmbedding(config.vocab_size, config.d_model, init_method=default_linear_init)
 
         if embed_tokens is not None:
             self.embed_tokens.weight = embed_tokens.weight
@@ -1304,7 +1333,7 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
 
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__(config)
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = ParallelEmbedding(config.vocab_size, config.d_model, init_method=default_linear_init)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -1479,7 +1508,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         super().__init__(config)
         self.model_dim = config.d_model
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = ParallelEmbedding(config.vocab_size, config.d_model, init_method=default_linear_init)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -1493,7 +1522,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False, init_method=default_linear_init)
 
         self.router_z_loss_coef = config.router_z_loss_coef
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -1799,7 +1828,7 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
 
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__(config)
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = ParallelEmbedding(config.vocab_size, config.d_model, init_method=default_linear_init)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.use_cache = False
@@ -1877,3 +1906,27 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         )
 
         return encoder_outputs
+
+
+if __name__ == '__main__':
+    import torch.distributed as dist
+    from accessory.util import misc
+    from transformers import AutoTokenizer
+    
+    def init_env():
+        # define the model
+        misc.init_distributed_mode()
+        fs_init.initialize_model_parallel(dist.get_world_size())
+
+    init_env()
+    rank = dist.get_rank()
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-8")
+    config = SwitchTransformersConfig.from_pretrained("google/switch-base-8")
+    # model = SwitchTransformersForConditionalGeneration(config).to(rank)
+    model = SwitchTransformersModel(config).to(rank)
+    model.eval()
+    input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you", return_tensors="pt").input_ids.to(rank)
+    decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids.to(rank)
+    decoder_input_ids = model._shift_right(decoder_input_ids)
+    outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+    print(outputs.last_hidden_state.shape)
