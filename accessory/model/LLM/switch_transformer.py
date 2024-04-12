@@ -1551,7 +1551,8 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         self.lm_head = new_embeddings
 
     def get_output_embeddings(self):
-        return self.lm_head
+        return None # PretrainedModel.tie_weights 函数会将 lm_head 绑定为 shared 参数，导致张量并行情况下 lm_head 参数发生不匹配的错误
+        # return self.lm_head
 
     def get_encoder(self):
         return self.encoder
@@ -1821,18 +1822,19 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
     def load_state_dict(self, state_dict_to_load):
         mp_size = fs_init.get_model_parallel_world_size()
         if mp_size == 1:
-            self.load_state_dict(state_dict_to_load)
+            super().load_state_dict(state_dict_to_load, strict=True)
 
+        # Todo: reproduce reults for tensor parallel case
         mp_rank = fs_init.get_model_parallel_rank()
         n_local_experts = self.__config.num_experts // mp_size
-        local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
+        local_experts = [i for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
         self_state_dict = self.state_dict()
         parallel_embedding_keys = [
             'shared.weight',
             'encoder.embed_tokens.weight',
             'decoder.embed_tokens.weight',
         ]
-        def is_qkv_module(name):
+        def is_qkv_lm_head_module(name):
             keywords = ['.q.weight', '.k.weight', '.v.weight', 'lm_head.weight']
             for keyword in keywords:
                 if keyword in name:
@@ -1841,13 +1843,13 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         is_o_module = lambda name: '.o.weight' in name
 
         for key, val in state_dict_to_load.items():
-            if is_qkv_module(key):
+            if is_qkv_lm_head_module(key):
                 # shard output feature size
+                # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[{start_index}:{end_index}, :] {val.data.shape}")
                 output_feature_size = val.shape[0]
                 shard_size = output_feature_size // mp_size
                 start_index = rank * shard_size
                 end_index = start_index + shard_size
-                # print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[start_index:end_index, :].shape}({val.data.shape})")
                 self_state_dict[key].data.copy_(val.data[start_index:end_index, :])
             elif is_o_module(key) or key in parallel_embedding_keys:
                 # shard input feature size
@@ -1855,18 +1857,18 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 shard_size = input_feature_size // mp_size
                 start_index = rank * shard_size
                 end_index = start_index + shard_size
-                # print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[:, start_index:end_index].shape}({val.data.shape})")
+                # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[:, {start_index}:{end_index}] {val.data.shape}")
                 self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
             else:
                 if 'mlp.experts' in key:
                     expert_idx = int(key.split('mlp.experts.expert_')[1].split('.')[0])
                     if expert_idx in local_experts:
-                        # print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                        # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                         self_state_dict[key].data.copy_(val.data)
                 else:
-                    # print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                    # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                     self_state_dict[key].data.copy_(val.data)
-                
+
 
 @add_start_docstrings(
     "The bare SWITCH_TRANSFORMERS Model transformer outputting encoder's raw hidden-states without any specific head"
@@ -1988,20 +1990,33 @@ if __name__ == '__main__':
 
 
     model = SwitchTransformersForConditionalGeneration(config)
+    model = model.bfloat16()
+    model.eval()
     input_ids = tokenizer(
-        "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
+        [
+            # "summarize: studies have shown that owning a dog is good for you",
+            # "tell me a joke",
+            "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flashfriendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
+        ], return_tensors="pt", padding=True
     ).input_ids.to(rank)  # Batch size 1
-    # model.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-    model.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False, init_method=default_linear_init)
 
     ckpt = torch.load('/data/personal/nus-hx/huggingface/hub/models--google--switch-base-8/snapshots/92fe2d22b024d9937146fe097ba3d3a7ba146e1b/pytorch_model.bin', map_location='cpu')
     model.load_state_dict(ckpt)
-    model = model.bfloat16().to(rank)
-    outputs = model.generate(input_ids, max_new_tokens=64)
-    print(tokenizer.decode(outputs[0]))
 
-    decoder_input_ids=torch.tensor([[0]]).int().to(rank)
-    outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
-    print(outputs.logits.shape)
+    # from transformers import SwitchTransformersForConditionalGeneration as HFSwitch
+    # hf_model = HFSwitch.from_pretrained("google/switch-base-8").to(rank)
+    # outputs = hf_model.generate(input_ids, max_new_tokens=200, do_sample=True)
+    # model.load_state_dict(hf_model.state_dict())
+    # print(tokenizer.decode(outputs[0]))
+
+    model = model.to(rank)
+    for i in range(10):
+        do_sample = i < 5
+        outputs = model.generate(input_ids, max_new_tokens=200, do_sample=do_sample)
+        print(tokenizer.decode(outputs[0]))
+
+    # decoder_input_ids=torch.tensor([[0]]*len(input_ids)).int().to(rank)
+    # outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+    # print(outputs.logits.shape)
 
 # torchrun --nproc-per-node=8 --master-port=6869 switch_transformer.py
