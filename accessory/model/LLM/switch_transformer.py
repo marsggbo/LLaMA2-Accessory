@@ -1522,8 +1522,8 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
-        # Todo: support ColumnParallelLinear
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False, init_method=default_linear_init)
+        # self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.router_z_loss_coef = config.router_z_loss_coef
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -1833,7 +1833,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
             'decoder.embed_tokens.weight',
         ]
         def is_qkv_module(name):
-            keywords = ['.q.weight', '.k.weight', '.v.weight']
+            keywords = ['.q.weight', '.k.weight', '.v.weight', 'lm_head.weight']
             for keyword in keywords:
                 if keyword in name:
                     return True
@@ -1847,7 +1847,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 shard_size = output_feature_size // mp_size
                 start_index = rank * shard_size
                 end_index = start_index + shard_size
-                print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[start_index:end_index, :].shape}({val.data.shape})")
+                # print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[start_index:end_index, :].shape}({val.data.shape})")
                 self_state_dict[key].data.copy_(val.data[start_index:end_index, :])
             elif is_o_module(key) or key in parallel_embedding_keys:
                 # shard input feature size
@@ -1855,16 +1855,16 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 shard_size = input_feature_size // mp_size
                 start_index = rank * shard_size
                 end_index = start_index + shard_size
-                print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[:, start_index:end_index].shape}({val.data.shape})")
+                # print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[:, start_index:end_index].shape}({val.data.shape})")
                 self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
             else:
                 if 'mlp.experts' in key:
                     expert_idx = int(key.split('mlp.experts.expert_')[1].split('.')[0])
                     if expert_idx in local_experts:
-                        print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                        # print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
                         self_state_dict[key].data.copy_(val.data)
                 else:
-                    print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                    # print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
                     self_state_dict[key].data.copy_(val.data)
                 
 
@@ -1991,7 +1991,9 @@ if __name__ == '__main__':
     input_ids = tokenizer(
         "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
     ).input_ids.to(rank)  # Batch size 1
-    model.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+    # model.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+    model.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False, init_method=default_linear_init)
+
     ckpt = torch.load('/data/personal/nus-hx/huggingface/hub/models--google--switch-base-8/snapshots/92fe2d22b024d9937146fe097ba3d3a7ba146e1b/pytorch_model.bin', map_location='cpu')
     model.load_state_dict(ckpt)
     model = model.bfloat16().to(rank)
