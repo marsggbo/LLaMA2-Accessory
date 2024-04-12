@@ -411,10 +411,9 @@ class SwitchTransformersAttention(nn.Module):
             self.d_model, self.inner_dim, bias=False, gather_output=False, init_method=default_linear_init)
         self.o = RowParallelLinear(
             self.inner_dim, self.d_model, bias=False, input_is_parallel=True, init_method=default_linear_init)
-        
 
         if self.has_relative_attention_bias:
-            self.relative_attention_bias = ParallelEmbedding(self.relative_attention_num_buckets, self.n_heads, init_method=default_linear_init)
+            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
         self.pruned_heads = set()
         self.gradient_checkpointing = False
 
@@ -1506,6 +1505,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
 
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__(config)
+        self.__config = config
         self.model_dim = config.d_model
 
         self.shared = ParallelEmbedding(config.vocab_size, config.d_model, init_method=default_linear_init)
@@ -1522,8 +1522,8 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
+        # Todo: support ColumnParallelLinear
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        print(f"In init {self.lm_head} {type(self.lm_head)} self.lm_head.weight.shape={self.lm_head.weight.shape}")
 
         self.router_z_loss_coef = config.router_z_loss_coef
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -1818,6 +1818,55 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
 
+    def load_state_dict(self, state_dict_to_load):
+        mp_size = fs_init.get_model_parallel_world_size()
+        if mp_size == 1:
+            self.load_state_dict(state_dict_to_load)
+
+        mp_rank = fs_init.get_model_parallel_rank()
+        n_local_experts = self.__config.num_experts // mp_size
+        local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
+        self_state_dict = self.state_dict()
+        parallel_embedding_keys = [
+            'shared.weight',
+            'encoder.embed_tokens.weight',
+            'decoder.embed_tokens.weight',
+        ]
+        def is_qkv_module(name):
+            keywords = ['.q.weight', '.k.weight', '.v.weight']
+            for keyword in keywords:
+                if keyword in name:
+                    return True
+            return False
+        is_o_module = lambda name: '.o.weight' in name
+
+        for key, val in state_dict_to_load.items():
+            if is_qkv_module(key):
+                # shard output feature size
+                output_feature_size = val.shape[0]
+                shard_size = output_feature_size // mp_size
+                start_index = rank * shard_size
+                end_index = start_index + shard_size
+                print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[start_index:end_index, :].shape}({val.data.shape})")
+                self_state_dict[key].data.copy_(val.data[start_index:end_index, :])
+            elif is_o_module(key) or key in parallel_embedding_keys:
+                # shard input feature size
+                input_feature_size = val.shape[1]
+                shard_size = input_feature_size // mp_size
+                start_index = rank * shard_size
+                end_index = start_index + shard_size
+                print(f"Shard {key} {start_index}:{end_index} {self_state_dict[key].shape} {val.data[:, start_index:end_index].shape}({val.data.shape})")
+                self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
+            else:
+                if 'mlp.experts' in key:
+                    expert_idx = int(key.split('mlp.experts.expert_')[1].split('.')[0])
+                    if expert_idx in local_experts:
+                        print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                        self_state_dict[key].data.copy_(val.data)
+                else:
+                    print(f"Full {key} {self_state_dict[key].data.shape} {val.data.shape}")
+                    self_state_dict[key].data.copy_(val.data)
+                
 
 @add_start_docstrings(
     "The bare SWITCH_TRANSFORMERS Model transformer outputting encoder's raw hidden-states without any specific head"
@@ -1938,12 +1987,19 @@ if __name__ == '__main__':
     # print(outputs.last_hidden_state.shape)
 
 
-    model = SwitchTransformersForConditionalGeneration(config).to(rank)
+    model = SwitchTransformersForConditionalGeneration(config)
     input_ids = tokenizer(
         "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
     ).input_ids.to(rank)  # Batch size 1
-    print(f"Out init: {model.lm_head} {type(model.lm_head)} model.lm_head.weight.shape={model.lm_head.weight.shape}")
-    outputs = model.generate(input_ids)
-    print(outputs)
+    model.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+    ckpt = torch.load('/data/personal/nus-hx/huggingface/hub/models--google--switch-base-8/snapshots/92fe2d22b024d9937146fe097ba3d3a7ba146e1b/pytorch_model.bin', map_location='cpu')
+    model.load_state_dict(ckpt)
+    model = model.bfloat16().to(rank)
+    outputs = model.generate(input_ids, max_new_tokens=64)
+    print(tokenizer.decode(outputs[0]))
+
+    decoder_input_ids=torch.tensor([[0]]).int().to(rank)
+    outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+    print(outputs.logits.shape)
 
 # torchrun --nproc-per-node=8 --master-port=6869 switch_transformer.py
