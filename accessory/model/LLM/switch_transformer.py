@@ -1522,7 +1522,8 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         decoder_config.num_layers = config.num_decoder_layers
         self.decoder = SwitchTransformersStack(decoder_config, self.shared)
 
-        self.lm_head = ColumnParallelLinear(config.d_model, config.vocab_size, bias=False, init_method=default_linear_init)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        print(f"In init {self.lm_head} {type(self.lm_head)} self.lm_head.weight.shape={self.lm_head.weight.shape}")
 
         self.router_z_loss_coef = config.router_z_loss_coef
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -1909,6 +1910,7 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
 
 
 if __name__ == '__main__':
+    import os
     import torch.distributed as dist
     from accessory.util import misc
     from transformers import AutoTokenizer
@@ -1918,15 +1920,30 @@ if __name__ == '__main__':
         misc.init_distributed_mode()
         fs_init.initialize_model_parallel(dist.get_world_size())
 
+    if os.environ.get('ipdb', False):
+        from ipdb import set_trace
+        set_trace()
+
     init_env()
     rank = dist.get_rank()
     tokenizer = AutoTokenizer.from_pretrained("google/switch-base-8")
     config = SwitchTransformersConfig.from_pretrained("google/switch-base-8")
-    # model = SwitchTransformersForConditionalGeneration(config).to(rank)
-    model = SwitchTransformersModel(config).to(rank)
-    model.eval()
-    input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you", return_tensors="pt").input_ids.to(rank)
-    decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids.to(rank)
-    decoder_input_ids = model._shift_right(decoder_input_ids)
-    outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
-    print(outputs.last_hidden_state.shape)
+    
+    # model = SwitchTransformersModel(config).to(rank)
+    # model.eval()
+    # input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you", return_tensors="pt").input_ids.to(rank)
+    # decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids.to(rank)
+    # decoder_input_ids = model._shift_right(decoder_input_ids)
+    # outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+    # print(outputs.last_hidden_state.shape)
+
+
+    model = SwitchTransformersForConditionalGeneration(config).to(rank)
+    input_ids = tokenizer(
+        "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
+    ).input_ids.to(rank)  # Batch size 1
+    print(f"Out init: {model.lm_head} {type(model.lm_head)} model.lm_head.weight.shape={model.lm_head.weight.shape}")
+    outputs = model.generate(input_ids)
+    print(outputs)
+
+# torchrun --nproc-per-node=8 --master-port=6869 switch_transformer.py
