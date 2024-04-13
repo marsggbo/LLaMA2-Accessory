@@ -403,6 +403,7 @@ class SwitchTransformersAttention(nn.Module):
         # Mesh TensorFlow initialization to avoid scaling before softmax
         self.mp_size = fs_init.get_model_parallel_world_size()
         self.mp_rank = fs_init.get_model_parallel_rank()
+        self.n_local_heads = self.n_heads // self.mp_size
         self.q = ColumnParallelLinear(
             self.d_model, self.inner_dim, bias=False, gather_output=False, init_method=default_linear_init)
         self.k = ColumnParallelLinear(
@@ -413,7 +414,7 @@ class SwitchTransformersAttention(nn.Module):
             self.inner_dim, self.d_model, bias=False, input_is_parallel=True, init_method=default_linear_init)
 
         if self.has_relative_attention_bias:
-            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
+            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_local_heads)
         self.pruned_heads = set()
         self.gradient_checkpointing = False
 
@@ -531,11 +532,11 @@ class SwitchTransformersAttention(nn.Module):
 
         def shape(states):
             """projection"""
-            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim//self.mp_size).transpose(1, 2)
+            return states.view(batch_size, -1, self.n_local_heads, self.key_value_proj_dim).transpose(1, 2)
 
         def unshape(states):
             """reshape"""
-            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim//self.mp_size)
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.n_local_heads * self.key_value_proj_dim)
 
         def project(hidden_states, proj_layer, key_value_states, past_key_value):
             """projects hidden states correctly to key/query states"""
@@ -565,7 +566,7 @@ class SwitchTransformersAttention(nn.Module):
             return hidden_states
 
         # get query states
-        query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+        query_states = shape(self.q(hidden_states))  # (batch_size, n_local_heads, seq_length, dim_per_head)
 
         # get key/value states
         key_states = project(
@@ -583,7 +584,7 @@ class SwitchTransformersAttention(nn.Module):
         if position_bias is None:
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
-                    (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
+                    (1, self.n_local_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
                 )
                 if self.gradient_checkpointing and self.training:
                     position_bias.requires_grad = True
@@ -596,7 +597,7 @@ class SwitchTransformersAttention(nn.Module):
                 position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
             if mask is not None:
-                position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+                position_bias = position_bias + mask  # (batch_size, n_local_heads, seq_length, key_length)
 
         if self.pruned_heads:
             mask = torch.ones(position_bias.shape[1])
@@ -888,7 +889,7 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
             module.router.classifier.weight.data.normal_(mean=0.0, std=factor * 1)
             mp_rank = fs_init.get_model_parallel_rank()
             mp_size = fs_init.get_model_parallel_world_size()
-            n_local_experts = config.num_experts // mp_size
+            n_local_experts = self.config.num_experts // mp_size
             local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
             for idx in local_experts:
                 module.experts[f"expert_{idx}"].wi.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
@@ -1851,7 +1852,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 start_index = rank * shard_size
                 end_index = start_index + shard_size
                 self_state_dict[key].data.copy_(val.data[start_index:end_index, :])
-            elif is_o_module(key) or key in parallel_embedding_keys:
+            elif is_o_module(key) or key in parallel_embedding_keys or 'relative_attention_bias' in key:
                 # shard input feature size
                 input_feature_size = val.shape[1]
                 shard_size = input_feature_size // mp_size
@@ -2011,12 +2012,12 @@ if __name__ == '__main__':
 
     model = model.to(rank)
     for i in range(10):
-        do_sample = i < 5
-        outputs = model.generate(input_ids, max_new_tokens=200, do_sample=do_sample)
+        do_sample = i > -1
+        outputs = model.generate(input_ids, max_new_tokens=200, do_sample=do_sample, temperature=0.8, top_k=100)
         print(tokenizer.decode(outputs[0]))
 
-    # decoder_input_ids=torch.tensor([[0]]*len(input_ids)).int().to(rank)
-    # outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
-    # print(outputs.logits.shape)
+        # decoder_input_ids=torch.tensor([[0]]*len(input_ids)).int().to(rank)
+        # outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
+        # print(outputs.logits.shape, outputs.logits[0,:20])
 
 # torchrun --nproc-per-node=8 --master-port=6869 switch_transformer.py
