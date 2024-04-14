@@ -1966,6 +1966,7 @@ if __name__ == '__main__':
     import torch.distributed as dist
     from accessory.util import misc
     from transformers import AutoTokenizer
+    from glob import glob
     
     def init_env():
         # define the model
@@ -1978,8 +1979,8 @@ if __name__ == '__main__':
 
     init_env()
     rank = dist.get_rank()
-    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-8")
-    config = SwitchTransformersConfig.from_pretrained("google/switch-base-8")
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-16")
+    config = SwitchTransformersConfig.from_pretrained("google/switch-base-16")
     
     # model = SwitchTransformersModel(config).to(rank)
     # model.eval()
@@ -1997,11 +1998,13 @@ if __name__ == '__main__':
         [
             # "summarize: studies have shown that owning a dog is good for you",
             # "tell me a joke",
-            "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flashfriendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
+            "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
         ], return_tensors="pt", padding=True
     ).input_ids.to(rank)  # Batch size 1
 
-    ckpt = torch.load('/data/personal/nus-hx/huggingface/hub/models--google--switch-base-8/snapshots/92fe2d22b024d9937146fe097ba3d3a7ba146e1b/pytorch_model.bin', map_location='cpu')
+    num_experts = 16
+    ckpt_file = glob(f'/data/personal/nus-hx/huggingface/hub/models--google--switch-base-{num_experts}/snapshots/*/pytorch_model.bin')[0]
+    ckpt = torch.load(ckpt_file, map_location='cpu')
     model.load_state_dict(ckpt)
 
     # from transformers import SwitchTransformersForConditionalGeneration as HFSwitch
