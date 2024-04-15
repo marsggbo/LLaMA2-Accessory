@@ -20,6 +20,7 @@ import math
 import warnings
 from typing import Optional, Tuple, Union
 import functools
+import os
 
 import torch
 import torch.nn as nn
@@ -327,11 +328,27 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         # new
         next_states = torch.zeros_like(hidden_states)
+        # print("Hidden shape ", hidden_states.shape)
+        # print(" *********************** ")
+        # for i in range(self.num_experts):
+        #     token_indices = router_mask[:, :, i].bool()
+        #     num_select = torch.count_nonzero(token_indices)
+        #     print(f'Expert {i} Received Tokens {num_select}')
+
         for expert_idx, expert in self.experts.items():
             idx = int(expert_idx.split('_')[1])
+            # if os.environ.get('EXPERT_DISTRIBUTION', 'normal')=='uniform':
             token_indices = router_mask[:, :, idx].bool()
-            if torch.any(token_indices):
-                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype) * router_probs[token_indices]
+            # token_indices = torch.zeros_like(token_indices)
+            # num_select_tokens = hidden_states.shape[0] // self.num_experts
+            # token_indices[:num_select_tokens, :] = True
+            # token_indices = token_indices.bool()
+            # print("Num select tokens ", num_select_tokens)
+            # print("Num select tokens ", torch.count_nonzero(token_indices))
+            # print("Next states ", next_states[token_indices].shape)
+            # token_indices = router_mask[:, :, idx].bool()
+            # if torch.any(token_indices):
+            next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype) * router_probs[token_indices]
         hidden_states = reduce_from_model_parallel_region(next_states)
 
         # # original
@@ -748,6 +765,7 @@ class SwitchTransformersBlock(nn.Module):
         else:
             self_attn_past_key_value, cross_attn_past_key_value = None, None
 
+        torch.cuda.nvtx.range_push("Self Attention")
         self_attention_outputs = self.layer[0](
             hidden_states,
             attention_mask=attention_mask,
@@ -757,6 +775,7 @@ class SwitchTransformersBlock(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
+        torch.cuda.nvtx.range_pop()
         hidden_states, present_key_value_state = self_attention_outputs[:2]
         attention_outputs = self_attention_outputs[2:]  # Keep self-attention outputs and relative position weights
 
@@ -774,6 +793,7 @@ class SwitchTransformersBlock(nn.Module):
             else:
                 query_length = None
 
+            torch.cuda.nvtx.range_push("Cross Attention")
             cross_attention_outputs = self.layer[1](
                 hidden_states,
                 key_value_states=encoder_hidden_states,
@@ -785,6 +805,7 @@ class SwitchTransformersBlock(nn.Module):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
             )
+            torch.cuda.nvtx.range_pop()
             hidden_states = cross_attention_outputs[0]
 
             # clamp inf values to enable fp16 training
@@ -800,7 +821,9 @@ class SwitchTransformersBlock(nn.Module):
             attention_outputs = attention_outputs + cross_attention_outputs[2:]
 
         # Apply Feed Forward layer
+        torch.cuda.nvtx.range_push("Feed Forward")
         hidden_states = self.layer[-1](hidden_states, output_router_logits)
+        torch.cuda.nvtx.range_pop()
 
         if isinstance(hidden_states, tuple):
             hidden_states, router_tuple = hidden_states
@@ -1849,14 +1872,14 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[{start_index}:{end_index}, :] {val.data.shape}")
                 output_feature_size = val.shape[0]
                 shard_size = output_feature_size // mp_size
-                start_index = rank * shard_size
+                start_index = mp_rank * shard_size
                 end_index = start_index + shard_size
                 self_state_dict[key].data.copy_(val.data[start_index:end_index, :])
             elif is_o_module(key) or key in parallel_embedding_keys or 'relative_attention_bias' in key:
                 # shard input feature size
                 input_feature_size = val.shape[1]
                 shard_size = input_feature_size // mp_size
-                start_index = rank * shard_size
+                start_index = mp_rank * shard_size
                 end_index = start_index + shard_size
                 # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[:, {start_index}:{end_index}] {val.data.shape}")
                 self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
@@ -2003,7 +2026,7 @@ if __name__ == '__main__':
     ).input_ids.to(rank)  # Batch size 1
 
     num_experts = 16
-    ckpt_file = glob(f'/data/personal/nus-hx/huggingface/hub/models--google--switch-base-{num_experts}/snapshots/*/pytorch_model.bin')[0]
+    ckpt_file = glob(f'/lustre/fsw/portfolios/coreai/users/shunkangz/NUS-Project/LLaMA2-Accessory/switch_ckpt/models--google--switch-base-{num_experts}/snapshots/*/pytorch_model.bin')[0]
     ckpt = torch.load(ckpt_file, map_location='cpu')
     model.load_state_dict(ckpt)
 

@@ -343,8 +343,12 @@ class TransformerBlock(nn.Module):
         self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
         mask: Union[torch.Tensor, str, None]
     ) -> torch.Tensor:
+        torch.cuda.nvtx.range_push("Self Attention")
         h = self._forward_attention(x, start_pos, freqs_cis, mask)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push("Feed Forward")
         out = self._forward_ffn(h)
+        torch.cuda.nvtx.range_pop()
         return out
 
 
@@ -362,10 +366,12 @@ class Transformer(nn.Module):
         for layer_id in range(args.n_layers):
             self.layers.append(TransformerBlock(layer_id, args))
 
+        torch.cuda.nvtx.range_push("Output Linear")
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = ColumnParallelLinear(
             args.dim, args.vocab_size, bias=False, init_method=default_linear_init
         )
+        torch.cuda.nvtx.range_pop()
 
         self.freqs_cis = precompute_freqs_cis(
             self.args.dim // self.args.n_heads, self.args.max_seq_len * 2,
