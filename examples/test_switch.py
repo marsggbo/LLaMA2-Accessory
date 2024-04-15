@@ -13,6 +13,7 @@ from torch.autograd import profiler as torch_profiler
 import numpy as np
 import random
 import json
+from glob import glob
 
 from accessory.util import misc
 from fairscale.nn.model_parallel import initialize as fs_init
@@ -29,6 +30,9 @@ from transformers import (
 )
 from dataclasses import dataclass
 from examples.scheduler import PatternScheduler
+
+from transformers.models.switch_transformers.configuration_switch_transformers import SwitchTransformersConfig
+from accessory.model.LLM.switch_transformer import SwitchTransformersForConditionalGeneration
 
 @dataclass
 class CustomDataCollatorWithPadding(DataCollatorWithPadding):
@@ -159,16 +163,16 @@ def main():
         "fp16": torch.float16,
     }[args.dtype]
     print('Loading MoE model and tokenizer')
-    model = MetaModel.from_pretrained(args.pretrained_path, args.llama_type, args.llama_config, args.tokenizer_path,
-                                    with_visual=False, max_seq_len=args.max_seq_len,
-                                    mp_group=fs_init.get_model_parallel_group(),
-                                    dtype=target_dtype, device="cpu" if args.quant else "cuda",)
+    # model = MetaModel.from_pretrained(args.pretrained_path, args.llama_type, args.llama_config, args.tokenizer_path,
+    #                                 with_visual=False, max_seq_len=args.max_seq_len,
+    #                                 mp_group=fs_init.get_model_parallel_group(),
+    #                                 dtype=target_dtype, device="cpu" if args.quant else "cuda",)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        "mistralai/Mistral-7B-Instruct-v0.2",
-        padding_side="right"
-    )
-    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     "mistralai/Mistral-7B-Instruct-v0.2",
+    #     padding_side="right"
+    # )
+    # tokenizer.pad_token = tokenizer.eos_token
 
     # with default_tensor_type(dtype=target_dtype, device="cpu" if args.quant else "cuda"):
     #     model = MetaModel(args.llama_type, args.llama_config, args.tokenizer_path, with_visual=False)
@@ -176,26 +180,38 @@ def main():
     # load_result = load_tensor_parallel_model_list(model, args.pretrained_path)
     # print("load result: ", load_result)
 
-    if args.quant:
-        print("Quantizing model to 4bit!")
-        from accessory.util.quant import quantize
-        from transformers.utils.quantization_config import BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig.from_dict(
-            config_dict={
-                "load_in_8bit": False, 
-                "load_in_4bit": True, 
-                "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": torch.bfloat16
-            },
-            return_unused_kwargs=False,
-        )
-        quantize(model, quantization_config)
+    # if args.quant:
+    #     print("Quantizing model to 4bit!")
+    #     from accessory.util.quant import quantize
+    #     from transformers.utils.quantization_config import BitsAndBytesConfig
+    #     quantization_config = BitsAndBytesConfig.from_dict(
+    #         config_dict={
+    #             "load_in_8bit": False, 
+    #             "load_in_4bit": True, 
+    #             "bnb_4bit_quant_type": "nf4",
+    #             "bnb_4bit_compute_dtype": torch.bfloat16
+    #         },
+    #         return_unused_kwargs=False,
+    #     )
+    #     quantize(model, quantization_config)
 
     # model.llma.layers = model.llma.layers[:8]
-    print("Model = %s" % str(model))
+    # print("Model = %s" % str(model))
     rank = torch.distributed.get_rank()
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-16")
+    config = SwitchTransformersConfig.from_pretrained("google/switch-base-16")
+
     device = torch.device(f"cuda:{rank}")
-    model = model.bfloat16().to(device)
+
+    model = SwitchTransformersForConditionalGeneration(config)
+    model = model.bfloat16()
+    model.eval()
+
+    num_experts = 16
+    ckpt_file = glob(f'/lustre/fsw/portfolios/coreai/users/shunkangz/NUS-Project/LLaMA2-Accessory/switch_ckpt/models--google--switch-base-{num_experts}/snapshots/*/pytorch_model.bin')[0]
+    ckpt = torch.load(ckpt_file, map_location='cpu')
+    model.load_state_dict(ckpt)
+    model = model.to(rank)
     
     print('Warm up model inference')
     # x = torch.randint(0, 10000, (2, 128)).to(device)
@@ -228,11 +244,11 @@ def main():
 
     
     # dataset = Dataset.load_from_disk('/home/nus-hx/code/vllm/examples/data/sst2_10000_mrpc_2000_MixtralMoE_patterns')
-    dataset = load_dataset("marsggbo/sst2_10000_mrpc_2000_MixtralMoE_patterns")['train']
-    # dataset = load_dataset("marsggbo/alpaca10k_yizhongw10k_MixtralMoE_patterns")['train']
+    # dataset = load_dataset("marsggbo/sst2_10000_mrpc_2000_MixtralMoE_patterns")['train']
+    dataset = load_dataset("marsggbo/alpaca10k_yizhongw10k_MixtralMoE_patterns")['train']
     dataset.shuffle(seed=1234)
 
-    batch_size = 256 
+    batch_size = 1024 
     num_samples = len(dataset)
     num_samples = batch_size * 10
 
@@ -284,14 +300,12 @@ def main():
         input_ids_list.append(input_ids)
         end = time.time()
         print("Input id Copy to GPU time ", end - start)
-        out = model.llma.forward_inference(input_ids, 0)
+        outputs = model.generate(input_ids, max_new_tokens=1)
         normal_tokens.append(input_ids.numel())
 
     # *********** Profile peroid ***********
-     # *********** Profile peroid ***********
     total_iter = 1
     torch.cuda.synchronize()
-    torch.distributed.barrier()
     start = time.time()
     for iter in range(total_iter):
         # for i, indices in enumerate(np.array_split(normal_indices, num_samples/batch_size)):
@@ -305,14 +319,14 @@ def main():
                 torch.cuda.nvtx.range_push(f'Batch {batch_id}')
                 # torch.cuda.synchronize()
                 # start = time.time()
-                out = model.llma.forward_inference(input_ids, 0)
+                outputs = model.generate(input_ids, max_new_tokens=1)
                 torch.cuda.nvtx.range_pop()
                 # torch.cuda.synchronize()
                 # end = time.time()
                 # print(f'Batch {batch_id} time {end - start}')
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
-
+    end = time.time()
     throughput = sum(normal_tokens) * total_iter / (end - start)
     print(f'Throughput is {throughput:.4f} token/s')
 
