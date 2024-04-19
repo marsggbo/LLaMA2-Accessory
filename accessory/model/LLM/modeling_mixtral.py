@@ -309,7 +309,7 @@ class MixtralAttention(nn.Module):
         self.mp_rank = fs_init.get_model_parallel_rank()
         self.num_local_heads = self.num_heads // self.mp_size
         self.num_local_key_value_heads = config.num_key_value_heads // self.mp_size
-        self.num_key_value_groups = self.num_local_heads // self.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -410,7 +410,7 @@ class MixtralAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.num_local_heads*self.head_dim)
 
         attn_output = self.o_proj(attn_output)
 
@@ -866,7 +866,6 @@ class MixtralSparseMoeBlock(nn.Module):
         self.experts = nn.ModuleDict()
         for idx in self.local_expert_indices:
             self.experts[str(idx)] = MixtralBlockSparseTop2MLP(config)
-
         # Jitter parameters
         # self.jitter_noise = config.router_jitter_noise
 
@@ -894,7 +893,7 @@ class MixtralSparseMoeBlock(nn.Module):
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
+        for expert_idx in self.local_expert_indices:
             expert_layer = self.experts[str(expert_idx)]
             idx, top_x = torch.where(expert_mask[expert_idx])
 
@@ -1564,10 +1563,8 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
                     shard_size = input_feature_size // self.mp_size
                     start_index = self.mp_rank * shard_size
                     end_index = start_index + shard_size
-                    # print(f"Rank{self.mp_rank}-{key} {self_state_dict[key].data.shape} val.data[:, {start_index}:{end_index}] {val.data.shape}")
                     local_ckpt[key] = val[:, start_index:end_index]
                 else:
-                    # print(f"Rank{mp_rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                     local_ckpt[key] = val
         super().load_state_dict(local_ckpt, strict=True)
         
@@ -1593,7 +1590,6 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
         for key, val in state_dict_to_load.items():
             if is_qkv_lm_head_module(key):
                 # shard output feature size
-                # print(f"Rank{self.mp_rank}-{key} {self_state_dict[key].data.shape} val.data[{start_index}:{end_index}, :] {val.data.shape}")
                 output_feature_size = val.shape[0]
                 shard_size = output_feature_size // self.mp_size
                 start_index = self.mp_rank * shard_size
@@ -1605,16 +1601,13 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
                 shard_size = input_feature_size // self.mp_size
                 start_index = self.mp_rank * shard_size
                 end_index = start_index + shard_size
-                # print(f"Rank{self.mp_rank}-{key} {self_state_dict[key].data.shape} val.data[:, {start_index}:{end_index}] {val.data.shape}")
                 self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
             else:
                 if 'block_sparse_moe.experts' in key:
                     expert_idx = int(key.split('block_sparse_moe.experts.')[1].split('.')[0])
                     if expert_idx in local_experts:
-                        # print(f"Rank{mp_rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                         self_state_dict[key].data.copy_(val.data)
                 else:
-                    # print(f"Rank{mp_rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                     self_state_dict[key].data.copy_(val.data)
 
 
@@ -1764,6 +1757,8 @@ if __name__ == '__main__':
     device = f"cuda:{rank}" if torch.cuda.is_available() else 'cpu'
 
     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
+    tokenizer.padding_side = 'left'
+    tokenizer.pad_token = tokenizer.unk_token
     config = MixtralConfig.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
     config.num_hidden_layers = 2 # for debug when #GPU limits
     print('Init model...')
@@ -1776,21 +1771,26 @@ if __name__ == '__main__':
         "/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/model.safetensors.index.json")[0]
     ckpt_files = glob(f'/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/*.safetensors')
     model.load_state_dict_from_safetensor_files(ckpt_files)
+    model = model.to(device)
     print('Loading weights from safetensor files. Finished')
 
-    tokenizer.pad_token = tokenizer.eos_token
-    input_ids = tokenizer(
+    data = tokenizer(
         [
             "summarize: studies have shown that owning a dog is good for you",
             "tell me a joke",
-            "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
-        ], return_tensors="pt", padding=True
-    ).input_ids.to(device)  # Batch size 1
-
-    # model = model.to(device)
-    # for i in range(10):
-    #     do_sample = i > -1
-    #     outputs = model.generate(input_ids, max_new_tokens=2, do_sample=do_sample, temperature=0.8, top_k=100)
-    #     print(tokenizer.decode(outputs[0]))
+            # "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
+        ], return_tensors="pt", padding=True, return_attention_mask=True
+    )  # Batch size 1
+    input_ids = data.input_ids.to(device)
+    attention_mask = data.attention_mask.to(device)
+    y = model(input_ids=input_ids, attention_mask=attention_mask)
+    print(y.logits.shape)
+    for i in range(10):
+        do_sample = i > -1
+        outputs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=2, do_sample=do_sample, temperature=0.8, top_k=100)
+        print(tokenizer.decode(outputs[0]))
 
 # torchrun --nproc-per-node=8 --master-port=6869 modeling_mixtral.py
